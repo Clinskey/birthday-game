@@ -1,59 +1,82 @@
-const http=require('http'),fs=require('fs'),path=require('path');
-const PORT=process.env.PORT||3000, DATA=process.env.DATA_FILE||path.join(__dirname,'game-state.json');
-const prompts=[
-'Nezuko','Meatball','The church next door on a Sunday morning','The L train',
-'A bushwick polycules McDonald’s drive through order','A group of rejected Pokémon',
-'Werner Herzog trying the Starbucks unicorn',
-'Summoning Ted Kazinski back from the grave to force him to review brainrot memes',
-'Fidel Castros birthday is interrupted with one of Kennedy’s lesser well known assasination attempts',
-'A Ghost who’s unfinished business is having never filmed and released his YouTube video essay on how SpongeBob has changed since Hillenburg left',
-'A man fully financing his burrito order into 5 easy payments with Klarna.',
-'You’re starting to think this priest may have exaggerated about aspects of his resume Mid Exorcism.',
-'A family politely ignoring cousins Rockos pending trial for treason at thanksgiving dinner.',
-'A player on survivor that is lying about their job because they don’t want everyone to know they’re a Zookeper.',
-'A movie review by a critic that had only ever seen air Bud movies before the movie they’re reviewing',
-'Three buddies have taken out a large parlay on the events of their friends daily life and they’re one leg away from making it big.',
-'You don’t want to be rude but your accountant seemingly doesn’t understand the concept of a marginal tax rate.',
-'Good Will Hunting with a reworked ending after early screenings to make sure it passes the bechdel test'];
-const initial=()=>({phase:'setup',teams:[{name:'Team 1',players:[]},{name:'Team 2',players:[]},{name:'Team 3',players:[]}],moles:[],index:0,scores:Array(18).fill(null),revision:0});
-let state;try{state=JSON.parse(fs.readFileSync(DATA,'utf8'));}catch{state=initial();}
+'use strict';
+const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
+const {prompts,questions,rules,bowlSeed}=require('./content');
+const safeBalls=require('./fake_bingo_draw_pool.json').draw_pool;
+const PORT=process.env.PORT||3000,DATA=process.env.DATA_FILE||path.join(__dirname,'game-state.json');
+const random=arr=>arr[Math.floor(Math.random()*arr.length)];
+const clone=x=>JSON.parse(JSON.stringify(x));
+const initial=()=>({phase:'setup',teams:[0,1,2].map(i=>({name:'Team '+(i+1),players:[]})),moles:[],noise:Array(18).fill(null),ni:0,teamScores:[0,0,0],moleScores:{},usedQuestions:[],board:[],activeQuestion:null,turn:0,triviaView:'board',triviaScore:null,drawnBalls:[],drawnRules:[],violationCounts:{},triviaEnded:false,bingoWinner:null,accusationTeam:0,accusations:[],caught:[],moleView:'waiting',moleScore:0,bowlClues:bowlSeed.slice(),bowlPass:0,bowlRemaining:[],bowlCurrent:null,bowlTurn:0,bowlTime:60,bowlRunning:false,bowlLastTick:0,bowlView:'waiting',bowlScore:[0,0,0,0],bowlDone:false,part2Accused:null,part2View:'waiting',stars:{Traveler:[],Rulebreaker:[],Fashionable:[]},starIndex:0,finalReveal:0,paused:false,revision:0});
+let state;try{state=JSON.parse(fs.readFileSync(DATA,'utf8'));if(!state||!state.phase||!state.teamScores)throw Error('old state');}catch{state=initial();}
+let undo=[],redo=[],lastHeartbeat=Date.now();
 function save(){state.revision=(state.revision||0)+1;fs.writeFileSync(DATA,JSON.stringify(state,null,2));}
-function publicState(){return {phase:state.phase,teams:state.teams,index:state.index,revision:state.revision,scoreboard:state.phase==='scores'?state.teams.map((t,i)=>({name:t.name,score:state.scores.reduce((sum,s,j)=>sum+(j%3===i&&s!==null?s:0),0)})):undefined,prompt:state.phase==='noise'?prompts[state.index]:undefined,activeTeam:state.phase==='noise'?state.teams[state.index%3].name:undefined};}
+function snapshot(){let x=clone(state);delete x.revision;return x;}
+function remember(){undo.push(snapshot());if(undo.length>100)undo.shift();redo=[];}
+function total(i){return +(state.teamScores[i]+state.bowlScore[i]+Object.entries(state.stars).reduce((a,[,players])=>a+players.filter(p=>state.teams[i].players.includes(p)).length*10,0)).toFixed(1);}
+function teamFor(p){return state.teams.findIndex(t=>t.players.includes(p));}
+function moleEarn(i,pts){for(const m of state.moles)if(teamFor(m)===i)state.moleScores[m]=+(state.moleScores[m]+pts).toFixed(1);}
+function reshuffleBoard(){const unused=questions.filter(q=>!state.usedQuestions.includes(q.id));state.board=[];for(const pool of ['Lore','Knowledge'])for(const difficulty of ['Easy','Medium','Hard','Impossible']){const available=unused.filter(q=>q.pool===pool&&!state.board.includes(q.id));const candidates=available.filter(q=>q.difficulty===difficulty);const pick=random(candidates.length?candidates:available);if(pick)state.board.push(pick.id);}}
+function drawRule(){const options=rules.map((_,i)=>i).filter(i=>!state.drawnRules.includes(i));if(!options.length)throw Error('No unused Roullette rules remain');const n=random(options);state.drawnRules.push(n);return rules[n];}
+function drawBall(){const options=safeBalls.filter(n=>!state.drawnBalls.includes(n));if(!options.length)throw Error('No safe Bingo balls remain');const n=random(options);state.drawnBalls.push(n);return n;}
+function publicScores(four=false){return state.teams.map((t,i)=>({name:t.name,score:total(i)})).concat(four?[{name:'Mole Team',score:state.moleScore+state.bowlScore[3]}]:[]);}
+function tv(){const s=state;const out={revision:s.revision,phase:s.phase,teams:s.teams.map(t=>({name:t.name,players:t.players})),paused:s.paused};
+ if(s.phase==='noise')Object.assign(out,{activeTeam:s.teams[s.ni%3].name,prompt:prompts[s.ni],ni:s.ni});
+ if(s.phase==='noiseScores')out.scoreboard=publicScores();
+ if(s.phase==='trivia'){out.view=s.triviaView;out.board=s.board.map(id=>questions.find(q=>q.id===id)).filter(Boolean).map(q=>({id:q.id,pool:q.pool,category:q.category,difficulty:q.difficulty}));out.question=s.activeQuestion?questions.find(q=>q.id===s.activeQuestion):null;out.draw=s.triviaDraw;out.scoreboard=s.triviaView==='scores'?publicScores():undefined;}
+ if(s.phase==='mole1'){out.view=s.moleView;if(s.moleView==='reveal'){out.roster=s.moles;out.scoreboard=[...publicScores(),{name:'Mole Team',score:s.moleScore}];}}
+ if(s.phase==='bowl'){out.view=s.bowlView;out.activeTeam=s.bowlTurn===3?'Mole Team':s.teams[s.bowlTurn].name;out.seconds=s.bowlTime;out.running=s.bowlRunning;out.lastTick=s.bowlLastTick;out.scoreboard=publicScores(true);}
+ if(s.phase==='mole2'){out.view=s.part2View;if(s.part2View==='waiting')out.scoreboard=publicScores(true);if(s.part2View==='scores')out.scoreboard=publicScores();}
+ if(s.phase==='stars'){out.star=['Traveler','Rulebreaker','Fashionable'][s.starIndex]||'Bonus Stars';}
+ if(s.phase==='final'){out.reveal=s.finalReveal;out.scoreboard=publicScores().sort((a,b)=>a.score-b.score);}
+ return out;}
+function err(msg){throw Error(msg)};
+function need(x,msg){if(!x)err(msg)};
+function apply(type,p){
+ if(type==='reset'){need(p.confirm==='RESET','Type RESET to confirm');state=initial();undo=[];redo=[];return;}
+ if(type==='undo'||type==='redo'){need(state.phase!=='final','Final scores are locked');const from=type==='undo'?undo:redo,to=type==='undo'?redo:undo;need(from.length,'Nothing to '+type);to.push(snapshot());const rev=state.revision;state=from.pop();state.revision=rev;return;}
+ if(type==='heartbeat'){lastHeartbeat=Date.now();return false;}
+ if(type==='pause'){state.paused=!state.paused;if(state.phase==='bowl'){if(state.paused){state.bowlWasRunning=state.bowlRunning;state.bowlRunning=false;}state.bowlLastTick=Date.now();}return;}
+ if(type==='resume'){state.paused=false;if(state.phase==='bowl'&&state.bowlWasRunning){state.bowlRunning=true;state.bowlLastTick=Date.now();state.bowlWasRunning=false;}return;}
+ need(!state.paused,'Game is paused');
+ if(type==='setup'){need(state.phase==='setup','Setup locked');need(Array.isArray(p.teams)&&p.teams.length===3,'Exactly 3 teams');const teams=p.teams.map((t,i)=>({name:String(t.name||`Team ${i+1}`).trim().slice(0,60),players:(t.players||[]).map(x=>String(x).trim()).filter(Boolean)}));const all=teams.flatMap(t=>t.players);need(new Set(all.map(x=>x.toLowerCase())).size===all.length,'Player names must be unique');state.teams=teams;state.moles=(p.moles||[]).filter(x=>all.includes(x));return;}
+ if(type==='start'){need(state.phase==='setup','Wrong phase');need(state.teams.every(t=>t.players.length&&t.players.some(p=>state.moles.includes(p))),'Each team needs at least one mole');state.moleScores=Object.fromEntries(state.moles.map(m=>[m,0]));state.phase='noise';return;}
+ if(type==='noiseScore'){need(state.phase==='noise','Wrong phase');need(Number.isInteger(p.score)&&p.score>=0&&p.score<=5,'Score 0–5');const old=state.noise[state.ni];if(old!==null){state.teamScores[state.ni%3]-=old;moleEarn(state.ni%3,-(5-old));}state.noise[state.ni]=p.score;state.teamScores[state.ni%3]+=p.score;moleEarn(state.ni%3,5-p.score);return;}
+ if(type==='noiseNext'){need(state.phase==='noise'&&state.noise[state.ni]!==null,'Score prompt first');need(state.ni<17,'Last prompt');state.ni++;return;}
+ if(type==='noiseReveal'){need(state.phase==='noise'&&state.ni===17&&state.noise[17]!==null,'Finish Noise Boys');state.phase='noiseScores';return;}
+ if(type==='beginTrivia'){need(state.phase==='noiseScores','Wrong phase');state.phase='trivia';state.turn=0;reshuffleBoard();return;}
+ if(type==='chooseQuestion'){need(state.phase==='trivia'&&state.triviaView==='board','Board not available');need(state.board.includes(p.id),'Question not on board');state.activeQuestion=p.id;state.triviaView='question';state.triviaScore=null;return;}
+ if(type==='grade'){need(state.phase==='trivia'&&state.triviaView==='question','No active question');const q=questions.find(q=>q.id===state.activeQuestion);need(q.type==='standard','Use All Play grading');const pts=Number(p.score);need(pts>=0&&pts<=5&&pts*2===Math.round(pts*2),'Use half-points from 0 to 5');const enough=!!p.enough;state.teamScores[state.turn]+=pts+(p.bonus&&q.bonus?q.bonus:0);moleEarn(state.turn,5-pts);state.usedQuestions.push(q.id);state.board=state.board.filter(id=>id!==q.id);state.triviaDraw=enough?{kind:'ball',value:drawBall()}:{kind:'rule',value:drawRule()};state.triviaView='draw';state.triviaNextTurn=!enough;return;}
+ if(type==='allPlay'){need(state.phase==='trivia'&&state.triviaView==='question','No active question');const q=questions.find(q=>q.id===state.activeQuestion);need(q.type==='allplay','Not All Play');const winner=Number(p.winner);need(winner>=0&&winner<3,'Select winner');state.teamScores[winner]+=5;const draws=[];for(let i=0;i<3;i++)if(i!==winner){moleEarn(i,5);draws.push({team:state.teams[i].name,rule:drawRule()});}state.usedQuestions.push(q.id);state.board=state.board.filter(id=>id!==q.id);state.triviaDraw={kind:'allplay',value:draws};state.triviaView='draw';state.triviaNextTurn=true;return;}
+ if(type==='violation'){need(state.phase==='trivia'&&!state.triviaEnded,'Only during Trivia Bingo');const i=teamFor(p.player);need(i>=0,'Unknown player');state.teamScores[i]--;moleEarn(i,1);state.violationCounts[p.player]=(state.violationCounts[p.player]||0)+1;return;}
+ if(type==='drawContinue'){need(state.phase==='trivia'&&state.triviaView==='draw','No draw');if(state.triviaNextTurn){state.turn=(state.turn+1)%3;reshuffleBoard();}else if(!state.board.length)reshuffleBoard();state.triviaView='board';state.activeQuestion=null;state.triviaDraw=null;return;}
+ if(type==='nextTurn'){need(state.phase==='trivia'&&state.triviaView==='board','Wrong phase');state.turn=(state.turn+1)%3;return;}
+ if(type==='endTrivia'){need(state.phase==='trivia','Wrong phase');need(p.winner===null||p.winner===undefined||[0,1,2].includes(Number(p.winner)),'Invalid Bingo winner');state.bingoWinner=p.winner===null||p.winner===undefined?null:Number(p.winner);if(state.bingoWinner!==null){state.teamScores[state.bingoWinner]+=10;moleEarn(state.bingoWinner,-10);}state.triviaEnded=true;state.triviaView='ended';return;}
+ if(type==='triviaReveal'){need(state.phase==='trivia'&&state.triviaView==='ended','End trivia first');state.triviaView='scores';return;}
+ if(type==='beginMole1'){need(state.phase==='trivia'&&state.triviaView==='scores','Wrong phase');state.phase='mole1';return;}
+ if(type==='accuse'){need(state.phase==='mole1'&&state.moleView==='waiting','Wrong phase');const player=String(p.player),i=state.accusationTeam;need(state.teams[i].players.includes(player),'Accuse someone on active team');need(!state.accusations.some(a=>a.player===player),'Already accused');const correct=state.moles.includes(player);state.accusations.push({team:i,player,correct});if(correct){state.caught.push(player);}else{state.teamScores[i]-=5;state.accusationTeam++;}return;}
+ if(type==='accuseNextTeam'){need(state.phase==='mole1'&&state.moleView==='waiting','Wrong phase');state.accusationTeam++;return;}
+ if(type==='moleReveal'){need(state.phase==='mole1'&&state.accusationTeam>=3,'Finish all three teams first');state.moleScore=state.moles.reduce((n,m)=>n+(state.moleScores[m]||0),0);state.moleView='reveal';return;}
+ if(type==='beginBowl'){need(state.phase==='mole1'&&state.moleView==='reveal','Reveal moles first');state.phase='bowl';state.bowlRemaining=state.bowlClues.map((_,i)=>i);state.bowlView='waiting';return;}
+ if(type==='addClue'){need(['setup','noise','noiseScores','trivia','mole1'].includes(state.phase),'Clue bank locked');need(String(p.text||'').trim(),'Empty clue');state.bowlClues.push(String(p.text).trim().slice(0,400));return;}
+ if(type==='editClue'){need(['setup','noise','noiseScores','trivia','mole1'].includes(state.phase),'Clue bank locked');need(Number.isInteger(p.index)&&p.index>=0&&p.index<state.bowlClues.length,'Invalid clue');if(p.text===null)state.bowlClues.splice(p.index,1);else state.bowlClues[p.index]=String(p.text).trim();return;}
+ if(type==='bowlStart'){need(state.phase==='bowl'&&state.bowlView==='waiting'&&!state.bowlDone,'Not waiting');need(state.bowlRemaining.length,'Empty bowl');state.bowlCurrent=random(state.bowlRemaining);state.bowlRemaining=state.bowlRemaining.filter(x=>x!==state.bowlCurrent);state.bowlRunning=true;state.bowlLastTick=Date.now();state.bowlView='playing';return;}
+ if(type==='bowlCorrect'){need(state.phase==='bowl'&&state.bowlCurrent!==null,'No clue');need(state.bowlRunning||state.bowlView==='expired','Timer not running');state.bowlScore[state.bowlTurn]++;state.bowlCurrent=null;if(state.bowlView==='expired'){state.bowlView='waiting';state.bowlTurn=(state.bowlTurn+1)%4;state.bowlTime=60;state.bowlRunning=false;return;}if(!state.bowlRemaining.length){state.bowlRunning=false;if(state.bowlPass===2){state.bowlDone=true;state.bowlView='finished';return;}state.bowlPass++;state.bowlRemaining=state.bowlClues.map((_,i)=>i);state.bowlView='refill';return;}state.bowlCurrent=random(state.bowlRemaining);state.bowlRemaining=state.bowlRemaining.filter(x=>x!==state.bowlCurrent);return;}
+ if(type==='bowlFailed'){need(state.phase==='bowl'&&state.bowlView==='expired','Only after buzzer');if(state.bowlCurrent!==null)state.bowlRemaining.push(state.bowlCurrent);state.bowlCurrent=null;state.bowlView='waiting';state.bowlTurn=(state.bowlTurn+1)%4;state.bowlTime=60;return;}
+ if(type==='bowlRefill'){need(state.phase==='bowl'&&state.bowlView==='refill','Not refilling');state.bowlCurrent=random(state.bowlRemaining);state.bowlRemaining=state.bowlRemaining.filter(x=>x!==state.bowlCurrent);state.bowlView='playing';state.bowlRunning=true;state.bowlLastTick=Date.now();return;}
+ if(type==='bowlShowScores'){need(state.phase==='bowl'&&state.bowlDone,'Not finished');state.bowlView='scores';return;}
+ if(type==='beginMole2'){need(state.phase==='bowl'&&state.bowlView==='scores','Show scores first');state.phase='mole2';return;}
+ if(type==='part2Accuse'){need(state.phase==='mole2'&&state.part2View==='waiting','Wrong phase');need(state.moles.includes(p.player),'Select a Mole Team player');state.part2Accused=p.player;return;}
+ if(type==='part2Reveal'){need(state.phase==='mole2'&&state.part2Accused,'Record accusation first');state.part2View='twist';for(const m of state.moles)if(m!==state.part2Accused)state.teamScores[teamFor(m)]+=5+(state.caught.includes(m)?5:0);return;}
+ if(type==='part2Scores'){need(state.phase==='mole2'&&state.part2View==='twist','Reveal twist first');state.part2View='scores';return;}
+ if(type==='beginStars'){need(state.phase==='mole2'&&state.part2View==='scores','Show scores first');state.phase='stars';return;}
+ if(type==='awardStar'){need(state.phase==='stars','Wrong phase');const star=['Traveler','Rulebreaker','Fashionable'][state.starIndex];need(star,'All stars awarded');need(Array.isArray(p.players)&&p.players.length>0,'Select at least one player');const all=state.teams.flatMap(t=>t.players);need(p.players.every(x=>all.includes(x)),'Unknown winner');state.stars[star]=[...new Set(p.players)];state.starIndex++;return;}
+ if(type==='finalReveal'){need(state.phase==='stars'&&state.starIndex===3,'Award all stars first');state.phase='final';state.finalReveal=1;return;}
+ if(type==='finalNext'){need(state.phase==='final','Wrong phase');const distinct=new Set(publicScores().map(t=>t.score)).size;state.finalReveal=Math.min(distinct,state.finalReveal+1);return;}
+ err('Unknown action '+type);
+}
+function tick(){if(state.phase!=='bowl'||!state.bowlRunning||state.paused)return;const now=Date.now();if(now-lastHeartbeat>6000){state.bowlWasRunning=true;state.bowlRunning=false;state.paused=true;state.bowlLastTick=now;save();return;}const elapsed=(now-state.bowlLastTick)/1000;if(elapsed<=0)return;state.bowlTime=Math.max(0,state.bowlTime-elapsed);state.bowlLastTick=now;if(state.bowlTime===0){state.bowlRunning=false;state.bowlView='expired';save();}}
+setInterval(tick,200);
 function json(res,code,data){res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(data));}
-const mime={'.html':'text/html; charset=utf-8','.js':'application/javascript','.css':'text/css'};
-http.createServer((req,res)=>{
- const url=new URL(req.url,'http://localhost');
- if(req.method==='GET'&&url.pathname==='/api/state')return json(res,200,publicState());
- if(req.method==='GET'&&url.pathname==='/api/host-state')return json(res,200,{...state,prompts});
- if(req.method==='POST'&&url.pathname==='/api/action'){
-  let raw='';req.on('data',c=>{raw+=c;if(raw.length>20000)req.destroy();});req.on('end',()=>{try{
-   const {type,payload}=JSON.parse(raw),p=payload||{};
-   if(type==='setup'){
-    if(state.phase!=='setup')throw Error('Setup is locked after Start Game');
-    if(!Array.isArray(p.teams)||p.teams.length!==3)throw Error('Exactly three teams required');
-    const teams=p.teams.map((t,i)=>({name:String(t.name||`Team ${i+1}`).trim().slice(0,50),players:Array.isArray(t.players)?t.players.map(x=>String(x).trim()).filter(Boolean).slice(0,30):[]}));
-    const all=teams.flatMap(t=>t.players);if(new Set(all.map(x=>x.toLowerCase())).size!==all.length)throw Error('Player names must be unique');
-    state.teams=teams;state.moles=Array.isArray(p.moles)?p.moles.filter(x=>all.includes(x)):[];
-   }else if(type==='start'){
-    if(state.phase!=='setup')throw Error('Already started');
-    if(state.teams.some(t=>!t.players.length||!t.players.some(x=>state.moles.includes(x))))throw Error('Each team needs players and at least one designated mole');
-    state.phase='noise';state.index=0;
-   }else if(type==='score'){
-    if(state.phase!=='noise')throw Error('Not in Noise Boys');
-    if(!Number.isInteger(p.score)||p.score<0||p.score>5)throw Error('Score must be 0–5');
-    state.scores[state.index]=p.score;
-   }else if(type==='next'){
-    if(state.phase!=='noise'||state.scores[state.index]===null)throw Error('Score current prompt first');
-    if(state.index===17)throw Error('Last prompt; reveal scores instead');state.index++;
-   }else if(type==='reveal'){
-    if(state.phase!=='noise'||state.index!==17||state.scores[17]===null)throw Error('Finish all 18 prompts first');state.phase='scores';
-   }else if(type==='reset'){
-    if(p.confirm!=='RESET')throw Error('Reset confirmation missing');state=initial();
-   }else throw Error('Unknown action');
-   save();json(res,200,{ok:true,state});
-  }catch(e){json(res,400,{error:e.message});}});return;
- }
- let file=url.pathname==='/'?'host.html':url.pathname.slice(1);
- if(!['host.html','tv.html','style.css'].includes(file))return json(res,404,{error:'Not found'});
- fs.readFile(path.join(__dirname,file),(err,buf)=>{if(err)return json(res,404,{error:'Not found'});res.writeHead(200,{'Content-Type':mime[path.extname(file)],'Cache-Control':'no-store'});res.end(buf);});
-}).listen(PORT,'0.0.0.0',()=>console.log(`Game ready at http://localhost:${PORT}/host.html and /tv.html`));
+const mime={'.html':'text/html; charset=utf-8','.js':'application/javascript','.css':'text/css','.png':'image/png','.jpeg':'image/jpeg'};
+http.createServer((req,res)=>{const u=new URL(req.url,'http://localhost');if(req.method==='GET'&&u.pathname==='/api/state')return json(res,200,tv());if(req.method==='GET'&&u.pathname==='/api/host-state')return json(res,200,{...state,prompts,questions,rules,hostScores:publicScores(true),undoCount:undo.length,redoCount:redo.length});
+ if(req.method==='POST'&&u.pathname==='/api/action'){let raw='';req.on('data',c=>{raw+=c;if(raw.length>150000)req.destroy();});req.on('end',()=>{try{const {type,payload={}}=JSON.parse(raw);if(type!=='heartbeat'&&!['undo','redo','reset'].includes(type))remember();const changed=apply(type,payload);if(changed!==false)save();json(res,200,{ok:true});}catch(e){if(undo.length&&raw&&!['undo','redo','reset','heartbeat'].includes((()=>{try{return JSON.parse(raw).type}catch{return ''}})())){const previous=undo.pop();if(previous){const revision=state.revision;state=previous;state.revision=revision;}}json(res,400,{error:e.message});}});return;}
+ let file=u.pathname==='/'?'host.html':u.pathname.slice(1);if(!['host.html','tv.html','style.css','content.js','yellow.png','pink.jpeg','tiers.jpeg'].includes(file))return json(res,404,{error:'Not found'});fs.readFile(path.join(__dirname,file),(e,b)=>{if(e)return json(res,404,{error:'Not found'});res.writeHead(200,{'Content-Type':mime[path.extname(file)],'Cache-Control':'no-store'});res.end(b);});}).listen(PORT,'0.0.0.0',()=>console.log('Birthday game on port '+PORT));
